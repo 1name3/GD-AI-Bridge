@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.21)
+#cmake_minimum_required(VERSION 3.21)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,8 +17,13 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
+# Windows Winsock
+if (WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32)
+endif()
+
 if (NOT DEFINED ENV{GEODE_SDK})
-    message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK")
+    message(FATAL_ERROR "Unable to find Geode SDK")
 else()
     message(STATUS "Found Geode: $ENV{GEODE_SDK}")
 endif()
