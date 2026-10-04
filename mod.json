@@ -1,0 +1,11 @@
+{
+    "geode": "v5.10.1",
+    "gd": {
+        "win": "2.2081"
+    },
+    "id": "knotennn.gd-ai-bridge",
+    "name": "GD AI Bridge",
+    "version": "v0.1.0",
+    "developer": "Knotennn",
+    "description": "Direct bridge between Geometry Dash and the GD AI Trainer."
+}
