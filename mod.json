@@ -1,8 +1,7 @@
 {
     "geode": "v5.10.1",
     "gd": {
-        "win": "2.2081",
-        "android": "2.2081"
+        "win": "2.2081"
     },
     "id": "knotennn.gd-ai-bridge",
     "name": "GD AI Bridge",
