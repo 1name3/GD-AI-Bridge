@@ -1,4 +1,6 @@
-#cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.21)
+
+project(GDAIBridge VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,16 +13,9 @@ endif()
 
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(GDAIBridge VERSION 0.1.0)
-
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
-
-# Windows Winsock
-if (WIN32)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32)
-endif()
 
 if (NOT DEFINED ENV{GEODE_SDK})
     message(FATAL_ERROR "Unable to find Geode SDK")
