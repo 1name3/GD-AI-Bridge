@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <cstdlib>
 #include <mutex>
 #include <sstream>
@@ -28,7 +30,7 @@ namespace GDABridge {
 
 static constexpr const char* HOST = "127.0.0.1";
 static constexpr int PORT = 8765;
-static constexpr int PROTOCOL = 3;
+static constexpr int PROTOCOL = 4;
 
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_connected{false};
@@ -37,6 +39,8 @@ static std::atomic<bool> g_debugBoxes{false};
 static std::atomic<bool> g_noclip{false};
 static std::atomic<bool> g_speedhack{false};
 static std::atomic<bool> g_practice{false};
+static std::atomic<bool> g_inLevel{false};
+static std::atomic<bool> g_needLevelReport{false};
 static std::atomic<float> g_speed{1.0f};
 static std::atomic<int> g_stateHz{30};
 static std::atomic<unsigned long> g_connectionCount{0};
@@ -44,15 +48,26 @@ static std::atomic<unsigned long> g_disconnectCount{0};
 static std::atomic<int> g_debugFPS{30};
 static std::atomic<int> g_debugDrawnObjects{0};
 static std::atomic<int> g_debugVisibleObjects{0};
+static constexpr int OBJECT_HZ = 5;
+static constexpr float OBJECT_LOOK_BEHIND = 280.f;
+static constexpr float OBJECT_LOOK_AHEAD = 2200.f;
+static constexpr int OBJECT_MAX_SENT = 120;
+static std::atomic<int> g_objectPackets{0};
 static int g_lastReportedLevelID = -1;
 static std::string g_lastReportedLevelName;
-static bool g_lastDebugActive = false;
+static std::atomic<bool> g_lastDebugActive{false};
 
 static SOCKET g_socket = INVALID_SOCKET;
 static std::mutex g_socketMutex;
 static std::mutex g_commandMutex;
 static std::vector<std::string> g_commands;
+
+static std::mutex g_outgoingMutex;
+static std::condition_variable g_outgoingCv;
+static std::deque<std::string> g_outgoing;
+static constexpr size_t MAX_OUTGOING = 128;
 static std::thread g_networkThread;
+static std::thread g_senderThread;
 
 static CCNode* g_debugNode = nullptr;
 
@@ -67,6 +82,10 @@ static float g_naturalTimeWarp = 1.0f;
 static std::chrono::steady_clock::time_point g_levelStart = std::chrono::steady_clock::now();
 static std::chrono::steady_clock::time_point g_lastState = std::chrono::steady_clock::now();
 static std::chrono::steady_clock::time_point g_lastObjects = std::chrono::steady_clock::now();
+static std::vector<GameObject*> g_sortedObjects;
+static int g_cachedLevelID = -1;
+
+static void clearOutgoing();
 
 static thread_local bool g_injectedInput = false;
 
@@ -107,6 +126,7 @@ static void closeSocket() {
     }
     g_connected = false;
     g_pythonResponsive = false;
+    clearOutgoing();
     if (wasConnected) {
         g_disconnectCount.fetch_add(1);
     }
@@ -130,8 +150,84 @@ static bool sendRaw(const std::string& payload) {
     return true;
 }
 
+static bool isTelemetryJson(const std::string& payload) {
+    return payload.find("{\"type\":\"state\"") == 0 ||
+        payload.find("{\"type\":\"objects\"") == 0 ||
+        payload.find("{\"type\":\"debug_status\"") == 0;
+}
+
+static void dropOldTelemetryLocked() {
+    for (auto it = g_outgoing.begin(); it != g_outgoing.end(); ++it) {
+        if (isTelemetryJson(*it)) {
+            g_outgoing.erase(it);
+            return;
+        }
+    }
+}
+
+static bool queueJson(std::string payload) {
+    payload.push_back('\n');
+    {
+        std::lock_guard<std::mutex> lock(g_outgoingMutex);
+
+        // State and object telemetry are snapshots. Never allow stale snapshots
+        // to build up when Python is busy or temporarily disconnected.
+        if (payload.rfind("{\"type\":\"state\"", 0) == 0 ||
+            payload.rfind("{\"type\":\"objects\"", 0) == 0) {
+            for (auto it = g_outgoing.begin(); it != g_outgoing.end();) {
+                const bool sameType =
+                    (payload.rfind("{\"type\":\"state\"", 0) == 0 && it->rfind("{\"type\":\"state\"", 0) == 0) ||
+                    (payload.rfind("{\"type\":\"objects\"", 0) == 0 && it->rfind("{\"type\":\"objects\"", 0) == 0);
+                if (sameType) {
+                    it = g_outgoing.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        while (g_outgoing.size() >= MAX_OUTGOING) {
+            dropOldTelemetryLocked();
+            if (g_outgoing.size() >= MAX_OUTGOING) {
+                g_outgoing.pop_front();
+            }
+        }
+
+        g_outgoing.emplace_back(std::move(payload));
+    }
+    g_outgoingCv.notify_one();
+    return true;
+}
+
 static bool sendJson(const std::string& json) {
-    return sendRaw(json + "\n");
+    if (!g_connected.load()) return false;
+    return queueJson(json);
+}
+
+static void clearOutgoing() {
+    std::lock_guard<std::mutex> lock(g_outgoingMutex);
+    g_outgoing.clear();
+}
+
+static void senderThread() {
+    while (g_running) {
+        std::string payload;
+        {
+            std::unique_lock<std::mutex> lock(g_outgoingMutex);
+            g_outgoingCv.wait_for(lock, std::chrono::milliseconds(100), [] {
+                return !g_running || !g_outgoing.empty();
+            });
+            if (!g_running) break;
+            if (g_outgoing.empty()) continue;
+            payload = std::move(g_outgoing.front());
+            g_outgoing.pop_front();
+        }
+
+        if (!sendRaw(payload)) {
+            clearOutgoing();
+            closeSocket();
+        }
+    }
 }
 
 static void queueCommand(const std::string& command) {
@@ -166,7 +262,7 @@ static int getCommandInt(const std::string& text, const char* key, int fallback)
 
 static void sendCheatStatus() {
     sendJson(
-        std::string("{\"type\":\"cheat_status\",\"protocol\":3,\"noclip\":") +
+        std::string("{\"type\":\"cheat_status\",\"protocol\":4,\"noclip\":") +
         bjson(g_noclip.load()) +
         ",\"speedhack\":" +
         bjson(g_speedhack.load()) +
@@ -181,12 +277,12 @@ static void sendCheatStatus() {
 }
 
 static void sendDebugStatus(bool force = false) {
-    const bool active = g_debugBoxes.load() && PlayLayer::get() != nullptr;
+    const bool active = g_debugBoxes.load() && g_inLevel.load();
     if (!force && active == g_lastDebugActive) return;
     g_lastDebugActive = active;
 
     sendJson(
-        std::string("{\"type\":\"debug_status\",\"protocol\":3,\"enabled\":") +
+        std::string("{\"type\":\"debug_status\",\"protocol\":4,\"enabled\":") +
         bjson(g_debugBoxes.load()) +
         ",\"active\":" + bjson(active) +
         ",\"drawn_objects\":" + std::to_string(g_debugDrawnObjects.load()) +
@@ -213,7 +309,7 @@ static void processCommand(const std::string& command) {
     log::info("[GD AI Bridge] RX command: {}", command);
 
     if (contains(command, "\"action\":\"ping\"")) {
-        sendJson("{\"type\":\"pong\",\"protocol\":3}");
+        sendJson("{\"type\":\"pong\",\"protocol\":4}");
         g_pythonResponsive = true;
         return;
     }
@@ -221,7 +317,7 @@ static void processCommand(const std::string& command) {
     if (contains(command, "\"action\":\"debug_boxes\"")) {
         if (contains(command, "\"enabled\":true")) g_debugBoxes = true;
         if (contains(command, "\"enabled\":false")) g_debugBoxes = false;
-        const int fps = std::max(5, std::min(60, getCommandInt(command, "\"fps\":", g_debugFPS.load())));
+        const int fps = std::max(5, std::min(30, getCommandInt(command, "\"fps\":", g_debugFPS.load())));
         g_debugFPS = fps;
         sendCommandResult("debug_boxes", true);
         sendDebugStatus(true);
@@ -393,7 +489,7 @@ static bool connectToServer() {
     log::info("[GD AI Bridge] TCP CONNECTED {}:{}", HOST, PORT);
 
     sendJson(
-        "{\"type\":\"hello\",\"protocol\":3,\"game\":\"Geometry Dash\",\"mod\":\"GD AI Bridge\",\"gd_version\":\"2.2081\",\"features\":[\"state\",\"objects\",\"input\",\"macro\",\"noclip\",\"speedhack\",\"practice\",\"debug\"]}"
+        "{\"type\":\"hello\",\"protocol\":4,\"game\":\"Geometry Dash\",\"mod\":\"GD AI Bridge\",\"gd_version\":\"2.2081\",\"features\":[\"state\",\"objects\",\"input\",\"macro\",\"noclip\",\"speedhack\",\"practice\",\"debug\"]}"
     );
     sendJson("{\"type\":\"ping\",\"source\":\"gd_mod\"}");
     sendCheatStatus();
@@ -472,32 +568,134 @@ static std::string playerJson(PlayerObject* player, float dt, int index) {
         "}";
 }
 
-static std::string objectsJson(PlayLayer* layer) {
-    if (!layer || !layer->m_objects) return "[]";
+static bool isOrbID(int id) {
+    switch (id) {
+        case 36:   // Yellow Jump Orb
+        case 84:   // Blue Gravity Orb
+        case 141:  // Pink Jump Orb
+        case 1330: // Black Drop Orb
+        case 1333: // Red Jump Orb
+        case 1704: // Green Dash Orb
+        case 1751: // Pink Gravity Dash Orb
+            return true;
+        default:
+            return false;
+    }
+}
 
-    std::string result = "[";
-    bool first = true;
+static const char* objectKind(int id) {
+    switch (id) {
+        case 36: return "YELLOW_ORB";
+        case 84: return "BLUE_ORB";
+        case 141: return "PINK_ORB";
+        case 1330: return "BLACK_ORB";
+        case 1333: return "RED_ORB";
+        case 1704: return "GREEN_DASH_ORB";
+        case 1751: return "PINK_GRAVITY_DASH_ORB";
+        case 35: return "YELLOW_PAD";
+        case 67: return "BLUE_PAD";
+        case 140: return "PINK_PAD";
+        case 1332: return "RED_PAD";
+        case 12: return "CUBE_PORTAL";
+        case 13: return "SHIP_PORTAL";
+        case 47: return "BALL_PORTAL";
+        case 111: return "UFO_PORTAL";
+        case 660: return "WAVE_PORTAL";
+        case 745: return "ROBOT_PORTAL";
+        case 1331: return "SPIDER_PORTAL";
+        case 1931: return "SWING_PORTAL";
+        default: return "OBJECT";
+    }
+}
 
+static bool isInteractiveID(int id) {
+    if (isOrbID(id)) return true;
+    switch (id) {
+        case 35: case 67: case 140: case 1332:
+        case 12: case 13: case 47: case 111: case 660: case 745: case 1331: case 1931:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void rebuildObjectCache(PlayLayer* layer) {
+    g_sortedObjects.clear();
+    g_cachedLevelID = -1;
+    if (!layer || !layer->m_objects || !layer->m_level) return;
+
+    g_sortedObjects.reserve(layer->m_objects->count());
     for (auto object : CCArrayExt<GameObject*>(layer->m_objects)) {
-        if (!object) continue;
-
-        if (!first) result += ",";
-        first = false;
-
-        const auto rect = object->getObjectRect();
-
-        result +=
-            "{\"id\":" + std::to_string(object->m_objectID) +
-            ",\"x\":" + fjson(object->getPositionX()) +
-            ",\"y\":" + fjson(object->getPositionY()) +
-            ",\"w\":" + fjson(rect.size.width) +
-            ",\"h\":" + fjson(rect.size.height) +
-            ",\"rotation\":" + fjson(object->getRotation()) +
-            "}";
+        if (object) g_sortedObjects.push_back(object);
     }
 
+    std::stable_sort(g_sortedObjects.begin(), g_sortedObjects.end(), [](GameObject* a, GameObject* b) {
+        return a->getPositionX() < b->getPositionX();
+    });
+    g_cachedLevelID = layer->m_level->m_levelID;
+}
+
+static std::string oneObjectJson(GameObject* object, float playerX) {
+    const auto rect = object->getObjectRect();
+    const float distance = rect.origin.x + rect.size.width * 0.5f - playerX;
+    const int id = object->m_objectID;
+    return
+        "{\"id\":" + std::to_string(id) +
+        ",\"x\":" + fjson(object->getPositionX()) +
+        ",\"y\":" + fjson(object->getPositionY()) +
+        ",\"w\":" + fjson(rect.size.width) +
+        ",\"h\":" + fjson(rect.size.height) +
+        ",\"rotation\":" + fjson(object->getRotation()) +
+        ",\"dx\":" + fjson(distance) +
+        ",\"kind\":\"" + objectKind(id) +
+        "\",\"interactive\":" + bjson(isInteractiveID(id)) +
+        ",\"orb\":" + bjson(isOrbID(id)) +
+        "}";
+}
+
+static std::string relevantObjectsJson(PlayLayer* layer, float lookBehind, float lookAhead, int maxCount, bool interactiveOnly = false) {
+    if (!layer || !layer->m_player1) return "[]";
+    if (!layer->m_level || g_cachedLevelID != layer->m_level->m_levelID || g_sortedObjects.empty()) {
+        rebuildObjectCache(layer);
+    }
+
+    const float px = layer->m_player1->getPositionX();
+    std::vector<GameObject*> candidates;
+    candidates.reserve(160);
+    for (auto object : g_sortedObjects) {
+        if (!object) continue;
+        const auto rect = object->getObjectRect();
+        const float centerX = rect.origin.x + rect.size.width * 0.5f;
+        const float dx = centerX - px;
+        if (dx < -lookBehind) continue;
+        if (dx > lookAhead) break;
+        if (interactiveOnly && !isInteractiveID(object->m_objectID)) continue;
+        candidates.push_back(object);
+    }
+
+    std::stable_sort(candidates.begin(), candidates.end(), [px](GameObject* a, GameObject* b) {
+        const auto ra = a->getObjectRect();
+        const auto rb = b->getObjectRect();
+        return std::abs((ra.origin.x + ra.size.width * 0.5f) - px) <
+               std::abs((rb.origin.x + rb.size.width * 0.5f) - px);
+    });
+
+    std::string result = "[";
+    const int count = std::min(maxCount, static_cast<int>(candidates.size()));
+    for (int i = 0; i < count; ++i) {
+        if (i) result += ",";
+        result += oneObjectJson(candidates[i], px);
+    }
     result += "]";
     return result;
+}
+
+static std::string actionableTargetsJson(PlayLayer* layer) {
+    return relevantObjectsJson(layer, 250.f, 1100.f, 16, true);
+}
+
+static std::string objectsJson(PlayLayer* layer) {
+    return relevantObjectsJson(layer, OBJECT_LOOK_BEHIND, OBJECT_LOOK_AHEAD, OBJECT_MAX_SENT, false);
 }
 
 static void clearDebugBoxes() {
@@ -511,96 +709,68 @@ static void drawDebugBoxes(PlayLayer* layer) {
     clearDebugBoxes();
     g_debugDrawnObjects = 0;
     g_debugVisibleObjects = 0;
-    if (!layer || !g_debugBoxes) return;
+    if (!layer || !g_debugBoxes || !layer->m_player1) return;
+
+    if (!layer->m_level || g_cachedLevelID != layer->m_level->m_levelID || g_sortedObjects.empty()) {
+        rebuildObjectCache(layer);
+    }
 
     auto node = CCDrawNode::create();
     if (!node) return;
-
     node->setZOrder(9999);
 
-    if (layer->m_player1) {
-        const auto rect = layer->m_player1->getObjectRect();
-        node->drawRect(
-            rect.origin,
-            rect.origin + rect.size,
-            ccc4f(1.f, 1.f, 0.f, 1.f),
-            2.5f,
-            ccc4f(1.f, 1.f, 0.f, 0.10f)
-        );
+    const auto playerRect = layer->m_player1->getObjectRect();
+    node->drawRect(
+        playerRect.origin,
+        playerRect.origin + playerRect.size,
+        ccc4f(1.f, 1.f, 0.f, 1.f),
+        2.f,
+        ccc4f(1.f, 1.f, 0.f, 0.08f)
+    );
+
+    const float px = layer->m_player1->getPositionX();
+    constexpr float LOOK_BEHIND = 220.f;
+    constexpr float LOOK_AHEAD = 1400.f;
+    constexpr int MAX_DRAW = 32;
+    constexpr int HIGHLIGHT = 12;
+
+    struct Candidate { GameObject* object; float dx; };
+    std::vector<Candidate> candidates;
+    candidates.reserve(48);
+
+    for (auto object : g_sortedObjects) {
+        if (!object) continue;
+        const auto rect = object->getObjectRect();
+        const float centerX = rect.origin.x + rect.size.width * 0.5f;
+        const float dx = centerX - px;
+        if (dx < -LOOK_BEHIND) continue;
+        if (dx > LOOK_AHEAD) break;
+        candidates.push_back({object, dx});
+        if (static_cast<int>(candidates.size()) >= 48) break;
     }
 
-    if (layer->m_player2) {
-        const auto rect = layer->m_player2->getObjectRect();
-        node->drawRect(
-            rect.origin,
-            rect.origin + rect.size,
-            ccc4f(0.f, 1.f, 1.f, 1.f),
-            2.5f,
-            ccc4f(0.f, 1.f, 1.f, 0.10f)
-        );
+    std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        const bool aOrb = isOrbID(a.object->m_objectID);
+        const bool bOrb = isOrbID(b.object->m_objectID);
+        if (aOrb != bOrb) return aOrb > bOrb;
+        return std::abs(a.dx) < std::abs(b.dx);
+    });
+
+    g_debugVisibleObjects = static_cast<int>(candidates.size());
+    const int drawCount = std::min(MAX_DRAW, static_cast<int>(candidates.size()));
+    for (int i = 0; i < drawCount; ++i) {
+        auto object = candidates[i].object;
+        const auto rect = object->getObjectRect();
+        const bool orb = isOrbID(object->m_objectID);
+        const bool highlighted = i < HIGHLIGHT && candidates[i].dx >= 0.f;
+        const auto edge = orb ? ccc4f(0.2f, 1.f, 0.4f, 1.f) : ccc4f(1.f, 0.25f, 0.15f, highlighted ? 1.f : 0.75f);
+        const auto fill = orb ? ccc4f(0.2f, 1.f, 0.4f, 0.07f) : ccc4f(1.f, 0.25f, 0.15f, 0.025f);
+        node->drawRect(rect.origin, rect.origin + rect.size, edge, orb ? 2.5f : 1.f, fill);
     }
+    g_debugDrawnObjects = drawCount;
 
-    if (layer->m_player1 && layer->m_objects) {
-        const float px = layer->m_player1->getPositionX();
-        constexpr float LOOK_BEHIND = 350.f;
-        constexpr float LOOK_AHEAD = 1500.f;
-        constexpr int MAX_OBJECTS = 90;
-        constexpr int HIGHLIGHT_OBJECTS = 12;
-
-        struct DebugObject {
-            GameObject* object;
-            float distance;
-        };
-
-        std::vector<DebugObject> candidates;
-        candidates.reserve(layer->m_objects->count());
-
-        for (auto object : CCArrayExt<GameObject*>(layer->m_objects)) {
-            if (!object) continue;
-            const auto rect = object->getObjectRect();
-            const float centerX = rect.origin.x + rect.size.width * 0.5f;
-            const float distance = centerX - px;
-            if (distance < -LOOK_BEHIND || distance > LOOK_AHEAD) continue;
-            candidates.push_back({object, distance});
-        }
-
-        g_debugVisibleObjects = static_cast<int>(candidates.size());
-
-        std::stable_sort(candidates.begin(), candidates.end(), [](const DebugObject& a, const DebugObject& b) {
-            const bool aAhead = a.distance >= 0.f;
-            const bool bAhead = b.distance >= 0.f;
-            if (aAhead != bAhead) return aAhead > bAhead;
-            return std::abs(a.distance) < std::abs(b.distance);
-        });
-
-        const int drawCount = std::min(MAX_OBJECTS, static_cast<int>(candidates.size()));
-        for (int i = 0; i < drawCount; ++i) {
-            auto object = candidates[i].object;
-            const auto rect = object->getObjectRect();
-            const bool highlighted = i < HIGHLIGHT_OBJECTS && candidates[i].distance >= 0.f;
-
-            node->drawRect(
-                rect.origin,
-                rect.origin + rect.size,
-                highlighted ? ccc4f(1.f, 0.4f, 0.1f, 1.f) : ccc4f(1.f, 0.f, 0.f, 0.85f),
-                highlighted ? 2.f : 1.f,
-                highlighted ? ccc4f(1.f, 0.4f, 0.1f, 0.08f) : ccc4f(1.f, 0.f, 0.f, 0.025f)
-            );
-        }
-
-        g_debugDrawnObjects = drawCount;
-
-        const auto playerRect = layer->m_player1->getObjectRect();
-        const float centerY = playerRect.origin.y + playerRect.size.height * 0.5f;
-        const float lookX = px + LOOK_AHEAD;
-        node->drawSegment(
-            ccp(px, centerY),
-            ccp(lookX, centerY),
-            1.f,
-            ccc4f(1.f, 1.f, 1.f, 0.35f)
-        );
-    }
-
+    const float centerY = playerRect.origin.y + playerRect.size.height * 0.5f;
+    node->drawSegment(ccp(px, centerY), ccp(px + LOOK_AHEAD, centerY), 1.f, ccc4f(1.f, 1.f, 1.f, 0.3f));
     layer->addChild(node);
     g_debugNode = node;
 }
@@ -628,7 +798,7 @@ class $modify(GDABridgeGameLayer, GJBaseGameLayer) {
 
             sendJson(
                 std::string(
-                    "{\"type\":\"input\",\"protocol\":3,\"timestamp\":"
+                    "{\"type\":\"input\",\"protocol\":4,\"timestamp\":"
                 ) +
                 std::to_string(t) +
                 ",\"action\":\"" + action +
@@ -664,7 +834,7 @@ static void reportCurrentLevel(PlayLayer* layer, bool force = false) {
     g_lastReportedLevelName = levelName;
 
     sendJson(
-        std::string("{\"type\":\"level_info\",\"protocol\":3,\"level_id\":") +
+        std::string("{\"type\":\"level_info\",\"protocol\":4,\"level_id\":") +
         std::to_string(levelID) +
         ",\"level_name\":\"" + escapeJson(levelName) +
         "\",\"practice\":" + bjson(layer->m_isPracticeMode) +
@@ -687,6 +857,8 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
         g_lastReportedLevelName.clear();
         g_debugDrawnObjects = 0;
         g_debugVisibleObjects = 0;
+        rebuildObjectCache(this);
+        g_inLevel = true;
 
         g_naturalTimeWarp = m_gameState.m_timeWarp;
 
@@ -703,7 +875,7 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
 
         sendJson(
             std::string(
-                "{\"type\":\"level_loaded\",\"protocol\":3,\"level_id\":"
+                "{\"type\":\"level_loaded\",\"protocol\":4,\"level_id\":"
             ) +
             std::to_string(levelID) +
             ",\"level_name\":\"" + escapeJson(levelName) +
@@ -735,7 +907,11 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
 
         PlayLayer::postUpdate(dt);
 
-        reportCurrentLevel(this);
+        if (g_needLevelReport.exchange(false)) {
+            reportCurrentLevel(this, true);
+        } else {
+            reportCurrentLevel(this);
+        }
 
         const auto now = std::chrono::steady_clock::now();
 
@@ -760,7 +936,7 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
 
             sendJson(
                 std::string(
-                    "{\"type\":\"state\",\"protocol\":3,\"frame_dt\":"
+                    "{\"type\":\"state\",\"protocol\":4,\"frame_dt\":"
                 ) + fjson(dt) +
                 ",\"progress\":" + fjson(progress) +
                 ",\"paused\":" + bjson(m_isPaused) +
@@ -770,6 +946,7 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
                 ",\"clicks\":" + std::to_string(m_clicks) +
                 ",\"practice\":" + bjson(m_isPracticeMode) +
                 ",\"timewarp\":" + fjson(m_gameState.m_timeWarp) +
+                ",\"targets\":" + actionableTargetsJson(this) +
                 ",\"player1\":" + playerJson(m_player1, dt, 1) +
                 ",\"player2\":" + playerJson(m_player2, dt, 2) +
                 ",\"cheats\":{\"noclip\":" + bjson(g_noclip.load()) +
@@ -782,17 +959,22 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
         }
 
         const float objectElapsed = std::chrono::duration<float>(now - g_lastObjects).count();
-        if (g_connected && objectElapsed >= 0.1f) {
+        if (g_connected && objectElapsed >= (1.f / static_cast<float>(OBJECT_HZ))) {
             g_lastObjects = now;
 
             const int count = m_objects ? m_objects->count() : 0;
 
+            g_objectPackets.fetch_add(1);
+            const std::string items = objectsJson(this);
             sendJson(
                 std::string(
-                    "{\"type\":\"objects\",\"protocol\":3,\"count\":"
+                    "{\"type\":\"objects\",\"protocol\":4,\"count\":"
                 ) +
                 std::to_string(count) +
-                ",\"items\":" + objectsJson(this) +
+                ",\"sent_count\":" + std::to_string(
+                    std::count(items.begin(), items.end(), '{')
+                ) +
+                ",\"items\":" + items +
                 "}"
             );
         }
@@ -851,6 +1033,7 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
         g_levelStart = std::chrono::steady_clock::now();
         g_haveP1 = false;
         g_haveP2 = false;
+        if (m_level && g_cachedLevelID != m_level->m_levelID) rebuildObjectCache(this);
 
         if (g_connected) {
             sendJson(
@@ -877,8 +1060,11 @@ class $modify(GDABridgePlayLayer, PlayLayer) {
         clearDebugBoxes();
         g_debugDrawnObjects = 0;
         g_debugVisibleObjects = 0;
+        g_inLevel = false;
         g_lastReportedLevelID = -1;
         g_lastReportedLevelName.clear();
+        g_sortedObjects.clear();
+        g_cachedLevelID = -1;
         PlayLayer::onExit();
         sendDebugStatus(true);
     }
@@ -1094,7 +1280,10 @@ $on_mod(Loaded) {
     log::info("[GD AI Bridge] ========================================");
 
     g_running = true;
+    g_senderThread = std::thread(senderThread);
     g_networkThread = std::thread(networkThread);
+    g_senderThread.detach();
+    g_networkThread.detach();
 }
 
 } // namespace GDABridge
