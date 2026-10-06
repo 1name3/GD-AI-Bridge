@@ -1,9 +1,12 @@
-#include <Geode/Geode.hpp>
-#include <Geode/modify/MenuLayer.hpp>
-#include <Geode/modify/PlayLayer.hpp>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+
+#include <Geode/Geode.hpp>
+#include <Geode/modify/MenuLayer.hpp>
+#include <Geode/modify/PlayLayer.hpp>
 
 #include <atomic>
 #include <chrono>
