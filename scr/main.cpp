@@ -8,6 +8,14 @@
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 
+#include <Geode/binding/PlayLayer.hpp>
+#include <Geode/binding/PlayerObject.hpp>
+#include <Geode/binding/GameObject.hpp>
+#include <Geode/binding/GJGameLevel.hpp>
+#include <Geode/binding/ButtonSprite.hpp>
+#include <Geode/binding/CCMenuItemSpriteExtra.hpp>
+#include <Geode/binding/FLAlertLayer.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -25,14 +33,12 @@ namespace GDABridge {
 
 static constexpr const char* HOST = "127.0.0.1";
 static constexpr int PORT = 8765;
-static constexpr int PROTOCOL_VERSION = 2;
+static constexpr int PROTOCOL = 2;
 
 
-/*
- * ============================================================
+/* ============================================================
  * GLOBAL STATE
- * ============================================================
- */
+ * ============================================================ */
 
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_connected{false};
@@ -53,32 +59,25 @@ static std::vector<std::string> g_commands;
 
 static std::thread g_networkThread;
 
-static PlayLayer* g_playLayer = nullptr;
-
 static CCNode* g_debugNode = nullptr;
 
 
-/*
- * Player 1 velocity history
- */
+/* ============================================================
+ * PLAYER VELOCITY HISTORY
+ * ============================================================ */
 
 static float g_lastP1X = 0.f;
 static float g_lastP1Y = 0.f;
 static bool g_haveP1Position = false;
-
-
-/*
- * Player 2 velocity history
- */
 
 static float g_lastP2X = 0.f;
 static float g_lastP2Y = 0.f;
 static bool g_haveP2Position = false;
 
 
-/*
- * Timing
- */
+/* ============================================================
+ * TIMING
+ * ============================================================ */
 
 static std::chrono::steady_clock::time_point g_lastStateTime =
     std::chrono::steady_clock::now();
@@ -87,11 +86,9 @@ static std::chrono::steady_clock::time_point g_lastObjectTime =
     std::chrono::steady_clock::now();
 
 
-/*
- * ============================================================
+/* ============================================================
  * JSON HELPERS
- * ============================================================
- */
+ * ============================================================ */
 
 static std::string jsonEscape(const std::string& input) {
 
@@ -149,11 +146,9 @@ static std::string numberJson(float value) {
 }
 
 
-/*
- * ============================================================
+/* ============================================================
  * SOCKET
- * ============================================================
- */
+ * ============================================================ */
 
 static void closeSocket() {
 
@@ -161,7 +156,13 @@ static void closeSocket() {
         g_socketMutex
     );
 
-    if (g_socket != INVALID_SOCKET) {
+    bool wasConnected =
+        g_connected.load();
+
+    if (
+        g_socket !=
+        INVALID_SOCKET
+    ) {
 
         shutdown(
             g_socket,
@@ -172,15 +173,22 @@ static void closeSocket() {
             g_socket
         );
 
-        g_socket = INVALID_SOCKET;
+        g_socket =
+            INVALID_SOCKET;
     }
 
-    if (g_connected) {
-        g_disconnectCount.fetch_add(1);
-    }
+    g_connected =
+        false;
 
-    g_connected = false;
-    g_pythonResponsive = false;
+    g_pythonResponsive =
+        false;
+
+    if (wasConnected) {
+
+        g_disconnectCount.fetch_add(
+            1
+        );
+    }
 }
 
 
@@ -192,29 +200,49 @@ static bool sendRaw(
         g_socketMutex
     );
 
-    if (g_socket == INVALID_SOCKET) {
+    if (
+        g_socket ==
+        INVALID_SOCKET
+    ) {
+
         return false;
     }
 
-    size_t totalSent = 0;
 
-    while (totalSent < data.size()) {
+    size_t sentTotal = 0;
 
-        int result = send(
-            g_socket,
-            data.data() + totalSent,
-            static_cast<int>(
-                data.size() - totalSent
-            ),
-            0
-        );
 
-        if (result <= 0) {
+    while (
+        sentTotal <
+        data.size()
+    ) {
+
+        int sent =
+            send(
+                g_socket,
+                data.data() + sentTotal,
+                static_cast<int>(
+                    data.size() -
+                    sentTotal
+                ),
+                0
+            );
+
+
+        if (
+            sent <= 0
+        ) {
+
             return false;
         }
 
-        totalSent += result;
+
+        sentTotal +=
+            static_cast<size_t>(
+                sent
+            );
     }
+
 
     return true;
 }
@@ -230,11 +258,9 @@ static bool sendJson(
 }
 
 
-/*
- * ============================================================
+/* ============================================================
  * COMMAND QUEUE
- * ============================================================
- */
+ * ============================================================ */
 
 static void queueCommand(
     const std::string& command
@@ -250,13 +276,15 @@ static void queueCommand(
 }
 
 
-static std::vector<std::string> takeCommands() {
+static std::vector<std::string>
+takeCommands() {
 
     std::lock_guard<std::mutex> lock(
         g_commandMutex
     );
 
-    auto result = g_commands;
+    auto result =
+        g_commands;
 
     g_commands.clear();
 
@@ -274,27 +302,23 @@ static bool contains(
 }
 
 
-/*
- * ============================================================
- * COMMAND PROCESSING
- * ============================================================
- */
+/* ============================================================
+ * PROCESS COMMAND
+ * ============================================================ */
 
 static void processCommand(
     const std::string& command
 ) {
 
     log::info(
-        "[GD AI Bridge] RX command: {}",
+        "[GD AI Bridge] RX: {}",
         command
     );
 
 
-    /*
-     * --------------------------------------------------------
+    /* --------------------------------------------------------
      * PING
-     * --------------------------------------------------------
-     */
+     * -------------------------------------------------------- */
 
     if (
         contains(
@@ -310,15 +334,16 @@ static void processCommand(
             "}"
         );
 
+        g_pythonResponsive =
+            true;
+
         return;
     }
 
 
-    /*
-     * --------------------------------------------------------
+    /* --------------------------------------------------------
      * DEBUG BOXES
-     * --------------------------------------------------------
-     */
+     * -------------------------------------------------------- */
 
     if (
         contains(
@@ -333,16 +358,22 @@ static void processCommand(
                 "\"enabled\":true"
             )
         ) {
-            g_debugBoxes = true;
+
+            g_debugBoxes =
+                true;
         }
+
         else if (
             contains(
                 command,
                 "\"enabled\":false"
             )
         ) {
-            g_debugBoxes = false;
+
+            g_debugBoxes =
+                false;
         }
+
 
         sendJson(
             std::string(
@@ -359,20 +390,14 @@ static void processCommand(
             "}"
         );
 
-        log::info(
-            "[GD AI Bridge] Debug boxes = {}",
-            g_debugBoxes.load()
-        );
 
         return;
     }
 
 
-    /*
-     * --------------------------------------------------------
+    /* --------------------------------------------------------
      * STATE HZ
-     * --------------------------------------------------------
-     */
+     * -------------------------------------------------------- */
 
     if (
         contains(
@@ -386,26 +411,42 @@ static void processCommand(
                 "\"value\":"
             );
 
+
         if (
             position !=
             std::string::npos
         ) {
 
-            position += 8;
+            position +=
+                8;
+
 
             int value =
                 std::atoi(
-                    command.c_str()
-                    + position
+                    command.c_str() +
+                    position
                 );
 
-            if (value < 1)
+
+            if (
+                value < 1
+            ) {
+
                 value = 1;
+            }
 
-            if (value > 120)
+
+            if (
+                value > 120
+            ) {
+
                 value = 120;
+            }
 
-            g_stateHz = value;
+
+            g_stateHz =
+                value;
+
 
             sendJson(
                 std::string(
@@ -415,21 +456,22 @@ static void processCommand(
                     "\"value\":"
                 )
                 +
-                std::to_string(value)
+                std::to_string(
+                    value
+                )
                 +
                 "}"
             );
         }
 
+
         return;
     }
 
 
-    /*
-     * --------------------------------------------------------
+    /* --------------------------------------------------------
      * JUMP
-     * --------------------------------------------------------
-     */
+     * -------------------------------------------------------- */
 
     if (
         contains(
@@ -438,16 +480,21 @@ static void processCommand(
         )
     ) {
 
+        auto playLayer =
+            PlayLayer::get();
+
+
         if (
-            g_playLayer &&
-            g_playLayer->m_player1
+            playLayer &&
+            playLayer->m_player1
         ) {
 
-            g_playLayer
+            playLayer
                 ->m_player1
                 ->pushButton(
                     PlayerButton::Jump
                 );
+
 
             sendJson(
                 "{"
@@ -456,11 +503,8 @@ static void processCommand(
                 "\"success\":true"
                 "}"
             );
-
-            log::info(
-                "[GD AI Bridge] Jump command executed"
-            );
         }
+
         else {
 
             sendJson(
@@ -473,15 +517,14 @@ static void processCommand(
             );
         }
 
+
         return;
     }
 
 
-    /*
-     * --------------------------------------------------------
+    /* --------------------------------------------------------
      * RELEASE
-     * --------------------------------------------------------
-     */
+     * -------------------------------------------------------- */
 
     if (
         contains(
@@ -490,16 +533,21 @@ static void processCommand(
         )
     ) {
 
+        auto playLayer =
+            PlayLayer::get();
+
+
         if (
-            g_playLayer &&
-            g_playLayer->m_player1
+            playLayer &&
+            playLayer->m_player1
         ) {
 
-            g_playLayer
+            playLayer
                 ->m_player1
                 ->releaseButton(
                     PlayerButton::Jump
                 );
+
 
             sendJson(
                 "{"
@@ -508,11 +556,8 @@ static void processCommand(
                 "\"success\":true"
                 "}"
             );
-
-            log::info(
-                "[GD AI Bridge] Release command executed"
-            );
         }
+
         else {
 
             sendJson(
@@ -525,13 +570,14 @@ static void processCommand(
             );
         }
 
+
         return;
     }
 
 
-    /*
-     * Unknown command
-     */
+    /* --------------------------------------------------------
+     * UNKNOWN COMMAND
+     * -------------------------------------------------------- */
 
     sendJson(
         "{"
@@ -543,11 +589,31 @@ static void processCommand(
 }
 
 
-/*
- * ============================================================
- * NETWORK RECEIVE LOOP
- * ============================================================
- */
+/* ============================================================
+ * PROCESS ALL PENDING COMMANDS
+ * ============================================================ */
+
+static void processPendingCommands() {
+
+    auto commands =
+        takeCommands();
+
+
+    for (
+        const auto& command :
+        commands
+    ) {
+
+        processCommand(
+            command
+        );
+    }
+}
+
+
+/* ============================================================
+ * NETWORK RECEIVE
+ * ============================================================ */
 
 static void receiveLoop() {
 
@@ -556,22 +622,28 @@ static void receiveLoop() {
     char temp[8192];
 
 
-    while (g_running) {
+    while (
+        g_running
+    ) {
 
         SOCKET socketCopy;
+
 
         {
             std::lock_guard<std::mutex> lock(
                 g_socketMutex
             );
 
-            socketCopy = g_socket;
+            socketCopy =
+                g_socket;
         }
+
 
         if (
             socketCopy ==
             INVALID_SOCKET
         ) {
+
             break;
         }
 
@@ -585,7 +657,10 @@ static void receiveLoop() {
             );
 
 
-        if (received <= 0) {
+        if (
+            received <= 0
+        ) {
+
             break;
         }
 
@@ -603,10 +678,12 @@ static void receiveLoop() {
                     '\n'
                 );
 
+
             if (
                 newline ==
                 std::string::npos
             ) {
+
                 break;
             }
 
@@ -627,13 +704,12 @@ static void receiveLoop() {
             if (
                 line.empty()
             ) {
+
                 continue;
             }
 
 
-            /*
-             * Python pong
-             */
+            /* Python response to our ping */
 
             if (
                 contains(
@@ -642,10 +718,11 @@ static void receiveLoop() {
                 )
             ) {
 
-                g_pythonResponsive = true;
+                g_pythonResponsive =
+                    true;
 
                 log::info(
-                    "[GD AI Bridge] Python responded to ping"
+                    "[GD AI Bridge] Python responded."
                 );
 
                 continue;
@@ -663,11 +740,9 @@ static void receiveLoop() {
 }
 
 
-/*
- * ============================================================
+/* ============================================================
  * CONNECT
- * ============================================================
- */
+ * ============================================================ */
 
 static bool connectToServer() {
 
@@ -685,7 +760,7 @@ static bool connectToServer() {
     ) {
 
         log::error(
-            "[GD AI Bridge] socket() failed"
+            "[GD AI Bridge] socket() failed."
         );
 
         return false;
@@ -694,11 +769,15 @@ static bool connectToServer() {
 
     sockaddr_in address{};
 
+
     address.sin_family =
         AF_INET;
 
+
     address.sin_port =
-        htons(PORT);
+        htons(
+            PORT
+        );
 
 
     if (
@@ -744,6 +823,7 @@ static bool connectToServer() {
             g_socketMutex
         );
 
+
         if (
             g_socket !=
             INVALID_SOCKET
@@ -756,14 +836,18 @@ static bool connectToServer() {
             return false;
         }
 
+
         g_socket =
             newSocket;
+
 
         g_connected =
             true;
 
+
         g_pythonResponsive =
             false;
+
 
         g_connectionCount.fetch_add(
             1
@@ -772,7 +856,7 @@ static bool connectToServer() {
 
 
     log::info(
-        "[GD AI Bridge] ========================================"
+        "[GD AI Bridge] ================================"
     );
 
     log::info(
@@ -780,13 +864,13 @@ static bool connectToServer() {
     );
 
     log::info(
-        "[GD AI Bridge] Server: {}:{}",
+        "[GD AI Bridge] {}:{}",
         HOST,
         PORT
     );
 
     log::info(
-        "[GD AI Bridge] ========================================"
+        "[GD AI Bridge] ================================"
     );
 
 
@@ -801,11 +885,6 @@ static bool connectToServer() {
     );
 
 
-    /*
-     * Immediately ask Python to prove that
-     * the other side is alive.
-     */
-
     sendJson(
         "{"
         "\"type\":\"ping\","
@@ -818,11 +897,9 @@ static bool connectToServer() {
 }
 
 
-/*
- * ============================================================
+/* ============================================================
  * NETWORK THREAD
- * ============================================================
- */
+ * ============================================================ */
 
 static void networkThread() {
 
@@ -837,7 +914,7 @@ static void networkThread() {
     ) {
 
         log::error(
-            "[GD AI Bridge] WSAStartup failed"
+            "[GD AI Bridge] WSAStartup failed."
         );
 
         return;
@@ -845,13 +922,17 @@ static void networkThread() {
 
 
     log::info(
-        "[GD AI Bridge] Network thread started"
+        "[GD AI Bridge] Network thread started."
     );
 
 
-    while (g_running) {
+    while (
+        g_running
+    ) {
 
-        if (!g_connected) {
+        if (
+            !g_connected
+        ) {
 
             if (
                 connectToServer()
@@ -859,6 +940,7 @@ static void networkThread() {
 
                 receiveLoop();
             }
+
             else {
 
                 std::this_thread::sleep_for(
@@ -886,16 +968,14 @@ static void networkThread() {
 
 
     log::info(
-        "[GD AI Bridge] Network thread stopped"
+        "[GD AI Bridge] Network thread stopped."
     );
 }
 
 
-/*
- * ============================================================
- * PLAYER STATE
- * ============================================================
- */
+/* ============================================================
+ * PLAYER JSON
+ * ============================================================ */
 
 static std::string playerJson(
     PlayerObject* player,
@@ -903,7 +983,10 @@ static std::string playerJson(
     int playerIndex
 ) {
 
-    if (!player) {
+    if (
+        !player
+    ) {
+
         return "null";
     }
 
@@ -929,21 +1012,30 @@ static std::string playerJson(
         ) {
 
             vx =
-                (x - g_lastP1X)
-                / dt;
+                (
+                    x -
+                    g_lastP1X
+                ) / dt;
+
 
             vy =
-                (y - g_lastP1Y)
-                / dt;
+                (
+                    y -
+                    g_lastP1Y
+                ) / dt;
         }
 
 
-        g_lastP1X = x;
-        g_lastP1Y = y;
+        g_lastP1X =
+            x;
+
+        g_lastP1Y =
+            y;
 
         g_haveP1Position =
             true;
     }
+
     else {
 
         if (
@@ -952,17 +1044,25 @@ static std::string playerJson(
         ) {
 
             vx =
-                (x - g_lastP2X)
-                / dt;
+                (
+                    x -
+                    g_lastP2X
+                ) / dt;
+
 
             vy =
-                (y - g_lastP2Y)
-                / dt;
+                (
+                    y -
+                    g_lastP2Y
+                ) / dt;
         }
 
 
-        g_lastP2X = x;
-        g_lastP2Y = y;
+        g_lastP2X =
+            x;
+
+        g_lastP2Y =
+            y;
 
         g_haveP2Position =
             true;
@@ -972,13 +1072,21 @@ static std::string playerJson(
     return
         "{"
         "\"x\":" +
-        numberJson(x) +
+        numberJson(
+            x
+        ) +
         ",\"y\":" +
-        numberJson(y) +
+        numberJson(
+            y
+        ) +
         ",\"vx\":" +
-        numberJson(vx) +
+        numberJson(
+            vx
+        ) +
         ",\"vy\":" +
-        numberJson(vy) +
+        numberJson(
+            vy
+        ) +
         ",\"rotation\":" +
         numberJson(
             player->getRotation()
@@ -993,7 +1101,7 @@ static std::string playerJson(
         ) +
         ",\"gravityFlipped\":" +
         boolJson(
-            player->m_gravityFlipped
+            player->m_isUpsideDown
         ) +
         ",\"onGround\":" +
         boolJson(
@@ -1003,23 +1111,25 @@ static std::string playerJson(
 }
 
 
-/*
- * ============================================================
- * OBJECT STATE
- * ============================================================
- */
+/* ============================================================
+ * OBJECT JSON
+ * ============================================================ */
 
 static std::string objectsJson(
     PlayLayer* layer
 ) {
 
-    if (!layer) {
+    if (
+        !layer
+    ) {
+
         return "[]";
     }
 
 
     std::string result =
         "[";
+
 
     bool first = true;
 
@@ -1035,16 +1145,24 @@ static std::string objectsJson(
             )
         ) {
 
-            if (!object) {
+            if (
+                !object
+            ) {
+
                 continue;
             }
 
 
-            if (!first) {
+            if (
+                !first
+            ) {
+
                 result += ",";
             }
 
-            first = false;
+
+            first =
+                false;
 
 
             auto rect =
@@ -1082,17 +1200,17 @@ static std::string objectsJson(
     }
 
 
-    result += "]";
+    result +=
+        "]";
+
 
     return result;
 }
 
 
-/*
- * ============================================================
- * DEBUG VISUALIZATION
- * ============================================================
- */
+/* ============================================================
+ * DEBUG DRAWING
+ * ============================================================ */
 
 static void clearDebugBoxes() {
 
@@ -1102,6 +1220,7 @@ static void clearDebugBoxes() {
 
         g_debugNode
             ->removeFromParent();
+
 
         g_debugNode =
             nullptr;
@@ -1120,6 +1239,7 @@ static void drawDebugBoxes(
         !g_debugBoxes ||
         !layer
     ) {
+
         return;
     }
 
@@ -1128,7 +1248,10 @@ static void drawDebugBoxes(
         CCDrawNode::create();
 
 
-    if (!node) {
+    if (
+        !node
+    ) {
+
         return;
     }
 
@@ -1138,9 +1261,7 @@ static void drawDebugBoxes(
     );
 
 
-    /*
-     * Player 1
-     */
+    /* Player 1 */
 
     if (
         layer->m_player1
@@ -1151,9 +1272,11 @@ static void drawDebugBoxes(
                 ->m_player1
                 ->getObjectRect();
 
+
         node->drawRect(
             rect.origin,
-            rect.origin + rect.size,
+            rect.origin +
+                rect.size,
             ccc4f(
                 1.f,
                 1.f,
@@ -1171,9 +1294,7 @@ static void drawDebugBoxes(
     }
 
 
-    /*
-     * Player 2
-     */
+    /* Player 2 */
 
     if (
         layer->m_player2
@@ -1184,9 +1305,11 @@ static void drawDebugBoxes(
                 ->m_player2
                 ->getObjectRect();
 
+
         node->drawRect(
             rect.origin,
-            rect.origin + rect.size,
+            rect.origin +
+                rect.size,
             ccc4f(
                 0.f,
                 1.f,
@@ -1204,18 +1327,14 @@ static void drawDebugBoxes(
     }
 
 
-    /*
-     * Objects
-     *
-     * Limit to 150 objects so debug mode does
-     * not become unnecessarily expensive.
-     */
+    /* Objects */
 
     if (
         layer->m_objects
     ) {
 
         int drawn = 0;
+
 
         for (
             auto object :
@@ -1224,7 +1343,10 @@ static void drawDebugBoxes(
             )
         ) {
 
-            if (!object) {
+            if (
+                !object
+            ) {
+
                 continue;
             }
 
@@ -1235,7 +1357,8 @@ static void drawDebugBoxes(
 
             node->drawRect(
                 rect.origin,
-                rect.origin + rect.size,
+                rect.origin +
+                    rect.size,
                 ccc4f(
                     1.f,
                     0.f,
@@ -1258,6 +1381,7 @@ static void drawDebugBoxes(
             if (
                 drawn >= 150
             ) {
+
                 break;
             }
         }
@@ -1268,16 +1392,15 @@ static void drawDebugBoxes(
         node
     );
 
+
     g_debugNode =
         node;
 }
 
 
-/*
- * ============================================================
- * PLAYLAYER HOOK
- * ============================================================
- */
+/* ============================================================
+ * PLAYLAYER
+ * ============================================================ */
 
 class $modify(
     GDABridgePlayLayer,
@@ -1298,13 +1421,12 @@ class $modify(
             );
 
 
-        if (!result) {
+        if (
+            !result
+        ) {
+
             return false;
         }
-
-
-        g_playLayer =
-            this;
 
 
         g_haveP1Position =
@@ -1315,7 +1437,7 @@ class $modify(
 
 
         log::info(
-            "[GD AI Bridge] PlayLayer initialized"
+            "[GD AI Bridge] PlayLayer initialized."
         );
 
 
@@ -1339,35 +1461,15 @@ class $modify(
         );
 
 
-        g_playLayer =
-            this;
-
-
         /*
-         * ------------------------------------------------------
-         * COMMANDS
-         * ------------------------------------------------------
+         * Commands are processed on GD's thread.
          */
 
-        auto commands =
-            takeCommands();
-
-
-        for (
-            const auto& command :
-            commands
-        ) {
-
-            processCommand(
-                command
-            );
-        }
+        processPendingCommands();
 
 
         /*
-         * ------------------------------------------------------
-         * STATE
-         * ------------------------------------------------------
+         * State
          */
 
         auto now =
@@ -1383,7 +1485,8 @@ class $modify(
 
         float elapsed =
             std::chrono::duration<float>(
-                now - g_lastStateTime
+                now -
+                g_lastStateTime
             ).count();
 
 
@@ -1412,12 +1515,12 @@ class $modify(
                         /
                         m_levelLength
                     )
-                    * 100.f;
+                    *
+                    100.f;
             }
 
 
             std::string levelName;
-
             int levelID = 0;
 
 
@@ -1438,11 +1541,17 @@ class $modify(
                 "\"type\":\"state\","
                 "\"protocol\":2,"
                 "\"frame_dt\":" +
-                numberJson(dt) +
+                numberJson(
+                    dt
+                ) +
                 ",\"progress\":" +
-                numberJson(progress) +
+                numberJson(
+                    progress
+                ) +
                 ",\"paused\":" +
-                boolJson(m_isPaused) +
+                boolJson(
+                    m_isPaused
+                ) +
                 ",\"level_id\":" +
                 std::to_string(
                     levelID
@@ -1478,14 +1587,13 @@ class $modify(
 
 
         /*
-         * ------------------------------------------------------
-         * OBJECTS
-         * ------------------------------------------------------
+         * Objects
          */
 
         float objectElapsed =
             std::chrono::duration<float>(
-                now - g_lastObjectTime
+                now -
+                g_lastObjectTime
             ).count();
 
 
@@ -1498,7 +1606,8 @@ class $modify(
                 now;
 
 
-            int count = 0;
+            int count =
+                0;
 
 
             if (
@@ -1537,30 +1646,27 @@ class $modify(
 
 
         /*
-         * ------------------------------------------------------
-         * DEBUG BOXES
-         * ------------------------------------------------------
-         *
-         * Draw at a lower frequency to avoid recreating
-         * the node unnecessarily every frame.
+         * Debug overlay
          */
 
-        static int debugFrameCounter = 0;
+        static int debugCounter = 0;
 
-        debugFrameCounter++;
+        debugCounter++;
 
 
         if (
             g_debugBoxes &&
-            debugFrameCounter >= 3
+            debugCounter >= 3
         ) {
 
-            debugFrameCounter = 0;
+            debugCounter =
+                0;
 
             drawDebugBoxes(
                 this
             );
         }
+
         else if (
             !g_debugBoxes
         ) {
@@ -1651,16 +1757,6 @@ class $modify(
         }
 
 
-        if (
-            g_playLayer ==
-            this
-        ) {
-
-            g_playLayer =
-                nullptr;
-        }
-
-
         clearDebugBoxes();
 
 
@@ -1669,29 +1765,15 @@ class $modify(
 };
 
 
-/*
- * ============================================================
- * IN-GAME / MAIN MENU DIAGNOSTIC UI
- * ============================================================
- *
- * This appears when Geometry Dash opens the main menu.
- *
- * It tells us:
- *
- *   MOD: LOADED
- *   TCP: CONNECTED / OFFLINE
- *   PYTHON: RESPONDING / WAITING
- *   Connections
- *   Disconnects
- *
- * Buttons:
- *
- *   RECONNECT
- *   PING
- *   DEBUG
- *
- * ============================================================
- */
+/* ============================================================
+ * DIAGNOSTIC UI
+ * ============================================================ */
+
+enum {
+    PANEL_TAG = 7001,
+    STATUS_TAG = 7002
+};
+
 
 class $modify(
     GDABridgeMenuLayer,
@@ -1703,56 +1785,111 @@ class $modify(
         if (
             !MenuLayer::init()
         ) {
+
             return false;
         }
 
 
+        auto winSize =
+            CCDirector::sharedDirector()
+                ->getWinSize();
+
+
         /*
-         * ------------------------------------------------------
-         * Panel
-         * ------------------------------------------------------
+         * Main menu button
+         */
+
+        auto mainButtonSprite =
+            ButtonSprite::create(
+                "AI",
+                "goldFont.fnt",
+                "GJ_button_01.png",
+                0.7f
+            );
+
+
+        auto mainButton =
+            CCMenuItemSpriteExtra::create(
+                mainButtonSprite,
+                this,
+                menu_selector(
+                    GDABridgeMenuLayer::openPanel
+                )
+            );
+
+
+        auto mainMenu =
+            CCMenu::create();
+
+
+        mainMenu->setPosition(
+            {
+                winSize.width - 45.f,
+                45.f
+            }
+        );
+
+
+        mainMenu->addChild(
+            mainButton
+        );
+
+
+        mainMenu->setZOrder(
+            10000
+        );
+
+
+        this->addChild(
+            mainMenu
+        );
+
+
+        /*
+         * Diagnostic panel
          */
 
         auto panel =
             CCLayerColor::create(
                 ccc4(
-                    0,
-                    0,
-                    0,
-                    210
+                    10,
+                    10,
+                    10,
+                    235
                 ),
-                360.f,
-                195.f
+                380.f,
+                225.f
             );
 
 
-        if (!panel) {
+        if (
+            !panel
+        ) {
+
             return true;
         }
 
 
-        panel->ignoreAnchorPointForPosition(
-            false
-        );
-
-
-        panel->setAnchorPoint(
-            {0.f, 0.f}
-        );
-
-
         panel->setPosition(
-            {20.f, 20.f}
+            {
+                20.f,
+                20.f
+            }
         );
 
 
         panel->setZOrder(
-            10000
+            10001
         );
 
 
-        panel->setID(
-            "gdai-panel"_spr
+        panel->setTag(
+            PANEL_TAG
+        );
+
+
+        panel->setVisible(
+            false
         );
 
 
@@ -1762,9 +1899,7 @@ class $modify(
 
 
         /*
-         * ------------------------------------------------------
          * Title
-         * ------------------------------------------------------
          */
 
         auto title =
@@ -1774,30 +1909,34 @@ class $modify(
             );
 
 
-        if (title) {
+        title->setScale(
+            0.55f
+        );
 
-            title->setScale(
-                0.55f
-            );
 
-            title->setAnchorPoint(
-                {0.f, 0.5f}
-            );
+        title->setAnchorPoint(
+            {
+                0.f,
+                0.5f
+            }
+        );
 
-            title->setPosition(
-                {20.f, 170.f}
-            );
 
-            panel->addChild(
-                title
-            );
-        }
+        title->setPosition(
+            {
+                20.f,
+                195.f
+            }
+        );
+
+
+        panel->addChild(
+            title
+        );
 
 
         /*
-         * ------------------------------------------------------
-         * Status label
-         * ------------------------------------------------------
+         * Status
          */
 
         auto status =
@@ -1807,45 +1946,76 @@ class $modify(
             );
 
 
-        if (status) {
+        status->setScale(
+            0.33f
+        );
 
-            status->setScale(
-                0.35f
-            );
 
-            status->setAnchorPoint(
-                {0.f, 1.f}
-            );
+        status->setAnchorPoint(
+            {
+                0.f,
+                1.f
+            }
+        );
 
-            status->setPosition(
-                {20.f, 145.f}
-            );
 
-            status->setID(
-                "gdai-status"_spr
-            );
+        status->setPosition(
+            {
+                20.f,
+                172.f
+            }
+        );
 
-            panel->addChild(
-                status
-            );
-        }
+
+        status->setTag(
+            STATUS_TAG
+        );
+
+
+        panel->addChild(
+            status
+        );
 
 
         /*
-         * ------------------------------------------------------
-         * RECONNECT BUTTON
-         * ------------------------------------------------------
+         * Endpoint
+         */
+
+        auto endpoint =
+            CCLabelBMFont::create(
+                "TCP 127.0.0.1:8765",
+                "bigFont.fnt"
+            );
+
+
+        endpoint->setScale(
+            0.28f
+        );
+
+
+        endpoint->setPosition(
+            {
+                190.f,
+                88.f
+            }
+        );
+
+
+        panel->addChild(
+            endpoint
+        );
+
+
+        /*
+         * RECONNECT
          */
 
         auto reconnectSprite =
             ButtonSprite::create(
                 "RECONNECT",
-                95,
-                true,
                 "goldFont.fnt",
                 "GJ_button_01.png",
-                30.f,
-                0.6f
+                0.7f
             );
 
 
@@ -1859,26 +2029,16 @@ class $modify(
             );
 
 
-        reconnect->setID(
-            "gdai-reconnect"_spr
-        );
-
-
         /*
-         * ------------------------------------------------------
-         * PING BUTTON
-         * ------------------------------------------------------
+         * PING
          */
 
         auto pingSprite =
             ButtonSprite::create(
                 "PING",
-                95,
-                true,
                 "goldFont.fnt",
                 "GJ_button_02.png",
-                30.f,
-                0.6f
+                0.7f
             );
 
 
@@ -1892,26 +2052,16 @@ class $modify(
             );
 
 
-        ping->setID(
-            "gdai-ping"_spr
-        );
-
-
         /*
-         * ------------------------------------------------------
-         * DEBUG BUTTON
-         * ------------------------------------------------------
+         * DEBUG
          */
 
         auto debugSprite =
             ButtonSprite::create(
                 "DEBUG",
-                95,
-                true,
                 "goldFont.fnt",
                 "GJ_button_03.png",
-                30.f,
-                0.6f
+                0.7f
             );
 
 
@@ -1925,15 +2075,31 @@ class $modify(
             );
 
 
-        debug->setID(
-            "gdai-debug"_spr
-        );
+        /*
+         * CLOSE
+         */
+
+        auto closeSprite =
+            ButtonSprite::create(
+                "CLOSE",
+                "goldFont.fnt",
+                "GJ_button_04.png",
+                0.7f
+            );
+
+
+        auto close =
+            CCMenuItemSpriteExtra::create(
+                closeSprite,
+                this,
+                menu_selector(
+                    GDABridgeMenuLayer::closePanel
+                )
+            );
 
 
         /*
-         * ------------------------------------------------------
-         * Button menu
-         * ------------------------------------------------------
+         * Menu
          */
 
         auto menu =
@@ -1942,15 +2108,15 @@ class $modify(
 
         menu->setPosition(
             {
-                180.f,
-                38.f
+                190.f,
+                42.f
             }
         );
 
 
         reconnect->setPosition(
             {
-                -110.f,
+                -120.f,
                 0.f
             }
         );
@@ -1966,7 +2132,7 @@ class $modify(
 
         debug->setPosition(
             {
-                110.f,
+                120.f,
                 0.f
             }
         );
@@ -1976,9 +2142,11 @@ class $modify(
             reconnect
         );
 
+
         menu->addChild(
             ping
         );
+
 
         menu->addChild(
             debug
@@ -1991,39 +2159,24 @@ class $modify(
 
 
         /*
-         * ------------------------------------------------------
-         * Footer
-         * ------------------------------------------------------
+         * Close button separately
          */
 
-        auto footer =
-            CCLabelBMFont::create(
-                "127.0.0.1:8765",
-                "bigFont.fnt"
-            );
+        close->setPosition(
+            {
+                190.f,
+                -5.f
+            }
+        );
 
 
-        if (footer) {
-
-            footer->setScale(
-                0.28f
-            );
-
-            footer->setPosition(
-                {
-                    180.f,
-                    90.f
-                }
-            );
-
-            panel->addChild(
-                footer
-            );
-        }
+        panel->addChild(
+            close
+        );
 
 
         /*
-         * Update UI four times per second.
+         * UI update
          */
 
         this->schedule(
@@ -2040,7 +2193,7 @@ class $modify(
 
 
         log::info(
-            "[GD AI Bridge] Diagnostic UI loaded"
+            "[GD AI Bridge] Diagnostic UI initialized."
         );
 
 
@@ -2048,39 +2201,52 @@ class $modify(
     }
 
 
-    /*
-     * ----------------------------------------------------------
-     * UPDATE UI
-     * ----------------------------------------------------------
-     */
-
     void updateBridgeUI(
         float
     ) {
 
+        /*
+         * The command queue is also processed from
+         * the main menu, so PING works without opening a level.
+         */
+
+        processPendingCommands();
+
+
         auto panel =
-            this->getChildByID(
-                "gdai-panel"_spr
+            this->getChildByTag(
+                PANEL_TAG
             );
 
 
-        if (!panel) {
+        if (
+            !panel
+        ) {
+
             return;
         }
 
 
         auto status =
-            panel->getChildByID(
-                "gdai-status"_spr
+            static_cast<CCLabelBMFont*>(
+                panel->getChildByTag(
+                    STATUS_TAG
+                )
             );
 
 
-        if (!status) {
+        if (
+            !status
+        ) {
+
             return;
         }
 
 
-        std::string text =
+        std::string text;
+
+
+        text +=
             "MOD: LOADED\n";
 
 
@@ -2091,6 +2257,7 @@ class $modify(
             text +=
                 "TCP: CONNECTED\n";
 
+
             if (
                 g_pythonResponsive
             ) {
@@ -2098,12 +2265,14 @@ class $modify(
                 text +=
                     "PYTHON: RESPONDING\n";
             }
+
             else {
 
                 text +=
                     "PYTHON: CONNECTED\n";
             }
         }
+
         else {
 
             text +=
@@ -2133,40 +2302,74 @@ class $modify(
     }
 
 
-    /*
-     * ----------------------------------------------------------
-     * RECONNECT
-     * ----------------------------------------------------------
-     */
+    void openPanel(
+        CCObject*
+    ) {
+
+        auto panel =
+            this->getChildByTag(
+                PANEL_TAG
+            );
+
+
+        if (
+            panel
+        ) {
+
+            panel->setVisible(
+                true
+            );
+
+
+            updateBridgeUI(
+                0.f
+            );
+        }
+    }
+
+
+    void closePanel(
+        CCObject*
+    ) {
+
+        auto panel =
+            this->getChildByTag(
+                PANEL_TAG
+            );
+
+
+        if (
+            panel
+        ) {
+
+            panel->setVisible(
+                false
+            );
+        }
+    }
+
 
     void onReconnect(
         CCObject*
     ) {
 
         log::info(
-            "[GD AI Bridge] Manual reconnect requested"
+            "[GD AI Bridge] Manual reconnect requested."
         );
-
-
-        g_pythonResponsive =
-            false;
 
 
         closeSocket();
 
 
+        /*
+         * The network thread automatically tries again.
+         */
+
         log::info(
-            "[GD AI Bridge] Socket closed. "
-            "Automatic reconnect will start."
+            "[GD AI Bridge] Automatic reconnect enabled."
         );
     }
 
-
-    /*
-     * ----------------------------------------------------------
-     * PING
-     * ----------------------------------------------------------
-     */
 
     void onPing(
         CCObject*
@@ -2177,8 +2380,7 @@ class $modify(
         ) {
 
             log::warn(
-                "[GD AI Bridge] Ping requested "
-                "while disconnected"
+                "[GD AI Bridge] Cannot ping: not connected."
             );
 
             return;
@@ -2204,12 +2406,6 @@ class $modify(
         );
     }
 
-
-    /*
-     * ----------------------------------------------------------
-     * DEBUG
-     * ----------------------------------------------------------
-     */
 
     void onDebug(
         CCObject*
@@ -2252,16 +2448,14 @@ class $modify(
 };
 
 
-/*
- * ============================================================
- * MOD LIFECYCLE
- * ============================================================
- */
+/* ============================================================
+ * MOD LOAD
+ * ============================================================ */
 
 $on_mod(Loaded) {
 
     log::info(
-        "[GD AI Bridge] ========================================"
+        "[GD AI Bridge] =================================="
     );
 
     log::info(
@@ -2269,22 +2463,21 @@ $on_mod(Loaded) {
     );
 
     log::info(
-        "[GD AI Bridge] Geometry Dash 2.2081"
+        "[GD AI Bridge] GD 2.2081"
     );
 
     log::info(
-        "[GD AI Bridge] Geode protocol {}",
-        PROTOCOL_VERSION
+        "[GD AI Bridge] Geode 5.10.1"
     );
 
     log::info(
-        "[GD AI Bridge] TCP target {}:{}",
+        "[GD AI Bridge] TCP {}:{}",
         HOST,
         PORT
     );
 
     log::info(
-        "[GD AI Bridge] ========================================"
+        "[GD AI Bridge] =================================="
     );
 
 
@@ -2296,41 +2489,6 @@ $on_mod(Loaded) {
         std::thread(
             networkThread
         );
-}
-
-
-$on_mod(Unloaded) {
-
-    log::info(
-        "[GD AI Bridge] Unloading..."
-    );
-
-
-    g_running =
-        false;
-
-
-    closeSocket();
-
-
-    if (
-        g_networkThread.joinable()
-    ) {
-
-        g_networkThread.join();
-    }
-
-
-    clearDebugBoxes();
-
-
-    g_playLayer =
-        nullptr;
-
-
-    log::info(
-        "[GD AI Bridge] Unloaded."
-    );
 }
 
 
