@@ -6,7 +6,7 @@
     },
     "id": "knotennn.gd-ai-bridge",
     "name": "GD AI Bridge",
-    "version": "v0.1.0",
+    "version": "v0.4.0",
     "developer": "Knotennn",
-    "description": "Direct bridge between Geometry Dash and the GD AI Trainer."
+    "description": "AI Trainer bridge with robust debug overlay, level detection, telemetry, macro input capture and training tools."
 }
