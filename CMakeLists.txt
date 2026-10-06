@@ -25,6 +25,39 @@ else()
     message(STATUS "Found Geode: $ENV{GEODE_SDK}")
 endif()
 
+# ------------------------------------------------------------
+# Windows / Winsock compatibility
+# ------------------------------------------------------------
+
+if (WIN32)
+
+    add_compile_definitions(
+        WIN32_LEAN_AND_MEAN
+        _WINSOCKAPI_
+        NOMINMAX
+    )
+
+endif()
+
+# ------------------------------------------------------------
+# Disable Geode PCH
+#
+# This prevents winsock.h from being pulled in before
+# winsock2.h through the generated precompiled header.
+# ------------------------------------------------------------
+
+set(
+    GEODE_DISABLE_PRECOMPILED_HEADERS
+    ON
+    CACHE BOOL
+    "Disable Geode precompiled headers for Winsock compatibility"
+    FORCE
+)
+
+# ------------------------------------------------------------
+# Geode SDK
+# ------------------------------------------------------------
+
 add_subdirectory(
     $ENV{GEODE_SDK}
     ${CMAKE_CURRENT_BINARY_DIR}/geode
